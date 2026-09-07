@@ -1,0 +1,8 @@
+▌ proposed plan
+  1. Add anonymized screen snapshot fixtures
+  2. Wire them into a behavioral detection suite
+  3. Document the bundled manifest schema
+
+Approve plan?
+
+[a] approve   [e] edit   [r] reject

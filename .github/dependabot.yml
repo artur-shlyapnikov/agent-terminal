@@ -1,0 +1,26 @@
+# Dependency update automation.
+#
+# SwiftPM: exactly one external dependency today (GRDB.swift, pinned upToNextMajor
+# in Packages/Package.swift). Weekly cadence is plenty for a single pin; PRs land
+# only after the full CI matrix passes, so upgrades stay gated.
+#
+# github-actions: keeps the three pinned actions (checkout/cache/gitleaks) current;
+# SHAs in workflows get bump PRs rather than silent tag drift.
+
+version: 2
+updates:
+  - package-ecosystem: "swift"
+    directory: "/Packages"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 4
+    commit-message:
+      prefix: "ci"

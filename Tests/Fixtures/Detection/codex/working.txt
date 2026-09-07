@@ -1,0 +1,4 @@
+▌ user: run the whole unit suite before committing
+  executing: swift test --scratch-path .build-ci
+
+⠹ thinking…

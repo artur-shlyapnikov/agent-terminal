@@ -1,0 +1,82 @@
+# Claude Code screen detection manifest (architecture §3.7).
+#
+# Safety policy: every rule is conservative; ambiguity resolves to unknown.
+# All waitingForInput descriptors are terminalOnly by default — approval
+# prompts are NEVER auto-answered. No rule produces composerAllowed.
+
+manifestVersion = 1
+agentKind = "claude-code"
+adapterVersionRange = ">=1.0 <3.0"
+foregroundExecutables = ["claude", "node"]
+snapshotRows = 32
+fallback = "unknown"
+
+# --- Priority 100: permission/approval prompts → waitingForInput(approval) ---
+
+[[rules]]
+id = "permission-prompt"
+resultingLifecycle = "waitingForInput"
+priority = 100
+requestKind = "approval"
+stabilityMilliseconds = 150
+allMatchers = [
+  { kind = "regex", pattern = "Do you want to (proceed|create|make|run|allow)", region = "lastLines", lines = 6 },
+]
+noneMatchers = [
+  { kind = "literal", pattern = "esc to cancel", region = "wholeSnapshot" },
+]
+
+[[rules]]
+id = "trust-dialog"
+resultingLifecycle = "waitingForInput"
+priority = 100
+requestKind = "selection"
+stabilityMilliseconds = 150
+anyMatchers = [
+  { kind = "regex", pattern = "^\\s*[❯>].*(Yes|No|Allow|Deny|Always)", region = "lastLines", lines = 4 },
+]
+
+# --- Priority 90: free-text questions from the agent (terminalOnly!) ---
+
+[[rules]]
+id = "free-text-question"
+resultingLifecycle = "waitingForInput"
+priority = 90
+requestKind = "freeText"
+stabilityMilliseconds = 150
+# A question ending one of the last two rows AND an empty composer marker on
+# the last row. The previous form demanded both patterns on the SAME lastLine
+# ("…?" and a bare "❯") — mutually exclusive, so the rule could never fire and
+# realistic question screens fell through to unknown. Requiring BOTH signals
+# across the two-row window stays conservative: neither a stray "?" nor a bare
+# prompt marker alone classifies as free-text input.
+allMatchers = [
+  { kind = "regex", pattern = "\\?\\n", region = "lastLines", lines = 2 },
+]
+anyMatchers = [
+  { kind = "regex", pattern = "^\\s*[❯>]\\s*$", region = "lastLine" },
+]
+
+# --- Priority 50: working markers ---
+
+[[rules]]
+id = "spinner-working"
+resultingLifecycle = "working"
+priority = 50
+anyMatchers = [
+  { kind = "regex", pattern = "(esc to interrupt|thinking|✻|·|✢).*", region = "lastLine" },
+]
+
+# --- Priority 10: idle prompt marker ---
+
+[[rules]]
+id = "idle-prompt"
+resultingLifecycle = "idle"
+priority = 10
+stabilityMilliseconds = 400
+allMatchers = [
+  { kind = "literal", pattern = ">", region = "lastLine" },
+]
+noneMatchers = [
+  { kind = "regex", pattern = "(Do you want|\\?\\s*$)", region = "lastLines", lines = 4 },
+]

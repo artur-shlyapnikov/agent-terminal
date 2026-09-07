@@ -1,0 +1,53 @@
+# OpenCode screen detection manifest (architecture §3.7).
+# OpenCode's plugin normally owns lifecycle authority; these screen rules are
+# the FALLBACK path when the plugin is absent or degraded. Conservative.
+
+manifestVersion = 1
+agentKind = "opencode"
+adapterVersionRange = ">=0.4 <2.0"
+foregroundExecutables = ["opencode", "node", "bun"]
+snapshotRows = 32
+fallback = "unknown"
+
+[[rules]]
+id = "permission-request"
+resultingLifecycle = "waitingForInput"
+priority = 100
+requestKind = "approval"
+stabilityMilliseconds = 150
+anyMatchers = [
+  { kind = "regex", pattern = "Permission (required|needed)", region = "lastLines", lines = 6 },
+  { kind = "regex", pattern = "^(allow|deny|once|always)\\b", region = "lastLine" },
+]
+
+[[rules]]
+id = "question-prompt"
+resultingLifecycle = "waitingForInput"
+priority = 90
+requestKind = "freeText"
+stabilityMilliseconds = 150
+allMatchers = [
+  { kind = "regex", pattern = "\\?$", region = "lastLine" },
+  { kind = "literal", pattern = "type your answer", region = "lastLines", lines = 3 },
+]
+
+[[rules]]
+id = "opencode-working"
+resultingLifecycle = "working"
+priority = 50
+anyMatchers = [
+  { kind = "regex", pattern = "(building|running|scanning|editing)…?$", region = "lastLine" },
+  { kind = "regex", pattern = "^\\s*[◐◓◑◒]", region = "lastLine" },
+]
+
+[[rules]]
+id = "opencode-idle"
+resultingLifecycle = "idle"
+priority = 10
+stabilityMilliseconds = 400
+allMatchers = [
+  { kind = "regex", pattern = "^\\s*[❯>]\\s*$", region = "lastLine" },
+]
+noneMatchers = [
+  { kind = "literal", pattern = "Permission", region = "lastLines", lines = 5 },
+]

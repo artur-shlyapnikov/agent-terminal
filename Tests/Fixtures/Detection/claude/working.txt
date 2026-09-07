@@ -1,0 +1,4 @@
+  Reading Packages/Sources/AgentCore/Runtime/AgentRuntime.swift
+  Editing Packages/Sources/AgentCore/Detection/ScreenDetectionEngine.swift
+
+✻ Refactoring… (esc to interrupt · 34s)

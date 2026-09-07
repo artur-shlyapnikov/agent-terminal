@@ -1,0 +1,5 @@
+tool write(path=".env.example")
+Permission required
+  this tool modifies a file outside the workspace
+
+allow once · allow always · deny

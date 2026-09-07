@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: nothing here needs write access to the repo.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint, format, dependency law
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install linters
+        run: brew install swiftlint swiftformat
+      - name: SwiftFormat (canonical style)
+        run: swiftformat Packages App Tests --lint
+      - name: SwiftLint (error-level rules fail the job)
+        run: swiftlint lint
+      - name: Dependency law (architecture notes §3.2)
+        run: python3 Scripts/check-dependency-law.py
+      - name: Third-party license audit
+        run: ./Scripts/verify-third-party-licenses.sh
+
+  secrets:
+    name: Secrets scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # full history so gitleaks can scan past commits
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          # Required only for organization repos; personal repos scan for free.
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+
+  packages:
+    name: SwiftPM build + tests
+    runs-on: macos-15
+    timeout-minutes: 45
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Select Xcode 16.4 (preinstalled on the macos-15 runner image)
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app
+      # Provisioning MUST precede any swift/xcodebuild step: package tests link
+      # -lghostty-internal from the gitignored Vendor/Ghostty/build directory.
+      # Cached per pinned upstream commit; on miss, built from scratch via zig.
+      - name: Restore vendored libghostty build
+        id: vendor-cache
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: Vendor/Ghostty/build
+          key: ghostty-build-${{ hashFiles('Vendor/Ghostty/commit.txt') }}
+      - name: Provision vendored libghostty (script bootstraps zig itself)
+        if: steps.vendor-cache.outputs.cache-hit != 'true'
+        run: ./Scripts/build-ghostty-xcframework.sh
+      - name: Verify vendored artifacts are present
+        run: |
+          test -f Vendor/Ghostty/build/lib/libghostty-internal.a
+          test -f Vendor/Ghostty/build/include/ghostty.h
+      - name: Resolve and test package
+        working-directory: Packages
+        run: |
+          swift package resolve
+          swift build
+          # --parallel (the SwiftPM default, made explicit): each target runs
+          # in its own xctest process. The historical full-suite stall was a
+          # test-side FakeClock race in PromptWatchdogTests, not a parallelism
+          # problem — see Scripts/TEST-STALL-FIX.md.
+          swift test --parallel
+      - name: Warnings are errors (first-party + pinned GRDB must stay clean)
+        working-directory: Packages
+        run: swift build --build-tests -Xswiftc -warnings-as-errors
+
+  app:
+    name: XcodeGen project + app build
+    runs-on: macos-15
+    timeout-minutes: 40
+    needs: [packages]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      # Same provisioning contract as the packages job: GhosttyBridge links
+      # -lghostty-internal, so Vendor/Ghostty/build must exist before xcodebuild.
+      - name: Restore vendored libghostty build
+        id: vendor-cache
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: Vendor/Ghostty/build
+          key: ghostty-build-${{ hashFiles('Vendor/Ghostty/commit.txt') }}
+      - name: Provision vendored libghostty (script bootstraps zig itself)
+        if: steps.vendor-cache.outputs.cache-hit != 'true'
+        run: ./Scripts/build-ghostty-xcframework.sh
+      - name: Verify vendored artifacts are present
+        run: |
+          test -f Vendor/Ghostty/build/lib/libghostty-internal.a
+          test -f Vendor/Ghostty/build/include/ghostty.h
+      - name: Install xcodegen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        working-directory: App
+        run: DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer xcodegen generate
+      - name: Build app scheme
+        run: >-
+          DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -workspace AgentTerminal.xcworkspace -scheme AgentTerminal
+          -destination 'platform=macOS,arch=arm64' build CODE_SIGNING_ALLOWED=NO
+      - name: App-hosted tests
+        run: >-
+          DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -workspace AgentTerminal.xcworkspace -scheme AgentTerminal
+          -destination 'platform=macOS,arch=arm64' test CODE_SIGNING_ALLOWED=NO
+      - name: Build acceptance scheme
+        run: >-
+          DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -workspace AgentTerminal.xcworkspace -scheme AgentTerminalAcceptance
+          -destination 'platform=macOS,arch=arm64' build CODE_SIGNING_ALLOWED=NO
+      - name: Stage-16 scenario smoke (fast subset)
+        run: |
+          APP=/tmp/at-dd-s16-smoke-dd/Build/Products/Debug/AgentTerminalAcceptance.app/Contents/MacOS/AgentTerminalAcceptance
+          DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer \
+            xcodebuild -workspace AgentTerminal.xcworkspace -scheme AgentTerminalAcceptance \
+            -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath /tmp/at-dd-s16-smoke-dd build CODE_SIGNING_ALLOWED=NO -quiet >/dev/null
+          # Corrupt-DB gate: garbled store must quarantine + banner, never crash.
+          printf 'not a database' > /tmp/ci-corrupt.sqlite3
+          ATERM_SCENARIO=corrupt-db ATERM_DB_PATH=/tmp/ci-corrupt.sqlite3 "$APP" >/dev/null 2>&1
+          # Capacity gate: 16 surfaces created alive+responsive, clean teardown.
+          ATERM_SCENARIO=capacity16 ATERM_DB_PATH=/tmp/ci-cap.sqlite3 "$APP" >/dev/null 2>&1
+          # Product-path teardown gate: 100 create/free cycles, stable footprint.
+          ATERM_SCENARIO=teardown100 ATERM_DB_PATH=/tmp/ci-td.sqlite3 "$APP" >/dev/null 2>&1
+          # The FULL 30-minute soak stays MANUAL/LOCAL by design (runner time):
+          # ATERM_SCENARIO=soak ATERM_SOAK_SECONDS=1800 … (see docs/Architecture/deviations.md D4).

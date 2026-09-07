@@ -1,0 +1,189 @@
+# XcodeGen project spec for the AgentTerminal macOS app.
+#
+# Generated project: App/AgentTerminal.xcodeproj (`xcodegen generate`).
+#
+# Dependency law (architecture notes §3.2): the App target may depend on ALL
+# package modules; helpers depend on AgentControl protocol models only, no AppKit.
+name: AgentTerminal
+options:
+  bundleIdPrefix: dev.aterm
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: YES
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    SWIFT_VERSION: "5.10"
+    ENABLE_HARDENED_RUNTIME: YES
+    # No run-script phases exist today; sandboxing blocks any future one from
+    # touching files outside declared inputs/outputs.
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    # Mirrors the packages job's -warnings-as-errors gate: app sources must
+    # stay warning-clean too.
+    SWIFT_TREAT_WARNINGS_AS_ERRORS: YES
+packages:
+  AgentTerminalPackages:
+    path: ../Packages
+targets:
+  AgentTerminal:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+        name: AppSources
+      # Stage-16 item C: the pinned libghostty commit ships INSIDE the bundle
+      # so diagnostics report it without a repo checkout.
+      - path: ../Vendor/Ghostty/commit.txt
+        buildPhase: resources
+      # Stage-16 localization catalog (English base; keys == English text).
+      - path: Sources/Localizable.xcstrings
+        buildPhase: resources
+    dependencies:
+      - package: AgentTerminalPackages
+        products:
+          - AgentCore
+          - GhosttyBridge
+          - TerminalKit
+          - AgentStore
+          - AgentControl
+      # Helpers are built as native targets from the SAME source files the
+      # SwiftPM executable targets compile (Packages/Sources/<Name>) and copied
+      # into Contents/Helpers (architecture notes §3.9 launch pipeline).
+      - target: AgentLauncher
+        copy:
+          destination: executables
+          subpath: Helpers
+      - target: agentctl
+        copy:
+          destination: executables
+          subpath: Helpers
+    info:
+      path: Support/Info.plist
+      properties:
+        CFBundleDisplayName: AgentTerminal
+        CFBundleShortVersionString: 0.1.0
+        CFBundleVersion: "1"
+        NSHumanReadableCopyright: ""
+        LSApplicationCategoryType: public.app-category.developer-tools
+        NSPrincipalClass: NSApplication
+        # Architecture §3.15: window close parks surfaces; app keeps running.
+        NSQuitAlwaysKeepsWindows: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.aterm.AgentTerminal
+        CODE_SIGN_ENTITLEMENTS: AgentTerminal.entitlements
+        # Local development signing; CI builds pass CODE_SIGNING_ALLOWED=NO.
+        CODE_SIGN_IDENTITY: "-"
+
+  # Acceptance harness (§4.6 + stage-5/8/12/15/16): a SECOND application
+  # target that adds the scenario sources on top of the same production
+  # shell. The shipping AgentTerminal target carries no scenario code —
+  # production modules no longer turn members public just so a privileged
+  # harness can reach them.
+  AgentTerminalAcceptance:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+        name: AppSources
+        excludes:
+          - "AppDelegate.swift"
+      - path: Acceptance
+        name: AcceptanceSources
+      - path: ../Vendor/Ghostty/commit.txt
+        buildPhase: resources
+      - path: Sources/Localizable.xcstrings
+        buildPhase: resources
+    dependencies:
+      - package: AgentTerminalPackages
+        products:
+          - AgentCore
+          - GhosttyBridge
+          - TerminalKit
+          - AgentStore
+          - AgentControl
+      - target: AgentLauncher
+        copy:
+          destination: executables
+          subpath: Helpers
+      - target: agentctl
+        copy:
+          destination: executables
+          subpath: Helpers
+    info:
+      path: Support/Acceptance-Info.plist
+      properties:
+        CFBundleDisplayName: AgentTerminalAcceptance
+        CFBundleShortVersionString: 0.1.0
+        CFBundleVersion: "1"
+        NSHumanReadableCopyright: ""
+        LSApplicationCategoryType: public.app-category.developer-tools
+        NSPrincipalClass: NSApplication
+        NSQuitAlwaysKeepsWindows: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.aterm.AgentTerminalAcceptance
+        CODE_SIGN_ENTITLEMENTS: AgentTerminal.entitlements
+        CODE_SIGN_IDENTITY: "-"
+  AgentTerminalTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+        name: AppTests
+    dependencies:
+      - target: AgentTerminal
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.aterm.AgentTerminalTests
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/AgentTerminal.app/Contents/MacOS/AgentTerminal
+        BUNDLE_LOADER: $(TEST_HOST)
+        GENERATE_INFOPLIST_FILE: YES
+
+  AgentLauncher:
+    type: tool
+    platform: macOS
+    sources:
+      - path: ../Packages/Sources/AgentLauncher
+        name: AgentLauncherSources
+    dependencies:
+      - package: AgentTerminalPackages
+        product: AgentControl
+    settings:
+      base:
+        PRODUCT_NAME: AgentLauncher
+  agentctl:
+    type: tool
+    platform: macOS
+    sources:
+      - path: ../Packages/Sources/agentctl
+        name: AgentCtlSources
+    dependencies:
+      - package: AgentTerminalPackages
+        product: AgentControl
+    settings:
+      base:
+        PRODUCT_NAME: agentctl
+schemes:
+  AgentTerminal:
+    build:
+      targets:
+        AgentTerminal: all
+        AgentLauncher: [build]
+        agentctl: [build]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - AgentTerminalTests
+  AgentTerminalAcceptance:
+    build:
+      targets:
+        AgentTerminalAcceptance: all
+        AgentLauncher: [build]
+        agentctl: [build]
+    run:
+      config: Debug

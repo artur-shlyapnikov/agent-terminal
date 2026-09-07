@@ -1,0 +1,6 @@
+▸ shell
+  $ rm -rf .build-fixtures/tmp-cache
+
+Allow command?
+
+[y] allow   [n] reject

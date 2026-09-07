@@ -1,0 +1,2 @@
+# Built artifacts are not committed; pin metadata and docs are tracked.
+build/

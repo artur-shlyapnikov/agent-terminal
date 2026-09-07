@@ -1,0 +1,69 @@
+# SwiftLint — AgentTerminal.
+# Scope: first-party sources only. Vendored/scratch trees never lint
+# Severity contract: CI fails on any ERROR (`swiftlint lint` exit code 2).
+# Warnings are tracked debt — fix on touch, don't stack new ones.
+# trailing_comma stays off to match .swiftformat (formatter owns that policy).
+
+included:
+  - Packages/Sources
+  - Packages/Tests
+  - App/Sources
+  - App/Tests
+
+excluded:
+  - Packages/.build*
+  - .build-integr
+
+opt_in_rules:
+  - force_cast
+  - force_try
+  - force_unwrapping
+  - implicitly_unwrapped_optional
+  - empty_count
+  - fatal_error_message
+
+force_cast:
+  severity: error
+force_try:
+  severity: error
+force_unwrapping:
+  severity: warning
+
+implicitly_unwrapped_optional:
+  severity: warning
+
+function_parameter_count:
+  warning: 8
+  error: 12
+  # LaunchTicket.make carries the full launch-descriptor surface by design
+  # (architecture §3.9); data-carrier factories are exempt from tighter caps.
+
+large_tuple:
+  warning: 3
+  error: 6
+
+
+line_length:
+  warning: 120
+  error: 160
+  ignores_comments: true
+
+identifier_name:
+  min_length: 1
+  allowed_symbols: ["_"]
+
+type_body_length:
+  warning: 400
+  error: 800
+
+file_length:
+  warning: 600
+  error: 1200
+
+function_body_length:
+  warning: 80
+  error: 300
+
+cyclomatic_complexity:
+  warning: 15
+  error: 25

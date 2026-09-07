@@ -1,0 +1,8 @@
+# SwiftFormat — AgentTerminal canonical style. CI enforces via `--lint`.
+# Vendored/scratch trees are never formatted or linted.
+--swiftversion 5.10
+--maxwidth 120
+--indent 4
+--exclude Vendor,Spike,.build-integr,Packages/.build*,Tests/Fixtures
+# Existing codebase style predates mandatory trailing commas — keep diffs minimal.
+--disable trailingCommas

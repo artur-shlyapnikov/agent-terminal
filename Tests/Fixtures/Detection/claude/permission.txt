@@ -1,0 +1,8 @@
+● Update(Packages/Sources/AgentCore/Detection/ScreenDetectionEngine.swift)
+  ⎿ Applied with 3 additions and 1 removal
+
+Do you want to proceed?
+
+  1. Yes
+  2. Yes, and do not ask again for this session
+  3. No

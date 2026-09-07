@@ -1,0 +1,5 @@
+┌ task
+│ refactor the prompt queue
+└ running
+
+◐ building index…
