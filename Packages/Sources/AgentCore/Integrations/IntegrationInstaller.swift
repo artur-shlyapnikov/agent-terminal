@@ -193,6 +193,10 @@ public final class IntegrationInstaller: @unchecked Sendable {
     private let homeDirectory: String
     private let syntaxValidator: SyntaxValidator
     private let fileManager: FileManager
+    private let recovery = InstallerFileRecovery(
+        tempPrefix: IntegrationInstaller.tempPrefix,
+        backupSuffix: IntegrationInstaller.backupSuffix
+    )
 
     static let tempPrefix = ".agentterminal-tmp-"
     static let backupSuffix = ".agentterminal-backup"
@@ -308,36 +312,12 @@ public final class IntegrationInstaller: @unchecked Sendable {
         // install unidentifiable to uninstall (§5.3).
         let previousFingerprints = recording.fingerprints(adapterID: plan.adapterID)
 
-        var backups: [String] = []
-        var previousState: [(path: String, existed: Bool, permissions: Int)] = []
         var modifiedTargets: [String] = []
+        var backup = InstallerFileRecovery.Backup(backupPaths: [], previousState: [], backupSuffix: Self.backupSuffix)
 
         do {
-            // Step 4: backups + remembered pre-state for crash-consistent rollback.
-            for path in changingPaths.sorted() {
-                let existed = fileManager.fileExists(atPath: path)
-                let permissions = try existed
-                    ? (fileManager.attributesOfItem(atPath: path)[.posixPermissions] as? Int ?? 0o644)
-                    : 0o644
-                previousState.append((path, existed, permissions))
-                if existed {
-                    let backupPath = path + Self.backupSuffix
-                    try? fileManager.removeItem(atPath: backupPath)
-                    do {
-                        try fileManager.copyItem(atPath: path, toPath: backupPath)
-                    } catch {
-                        // A mid-copy failure must never leave a PARTIAL backup
-                        // on disk: rollback re-derives this exact path, would
-                        // see it as a complete snapshot, and move it over the
-                        // original — destroying user data (§3.17).
-                        try? fileManager.removeItem(atPath: backupPath)
-                        throw error
-                    }
-                    backups.append(backupPath)
-                }
-            }
+            backup = try recovery.backup(Array(changingPaths), using: fileManager)
 
-            // Steps 5–7: merged content → temp write → validate → atomic rename.
             for edit in plan.files {
                 let target = expandPath(edit.targetPathTemplate)
                 guard changingPaths.contains(target) else { continue }
@@ -349,29 +329,21 @@ public final class IntegrationInstaller: @unchecked Sendable {
                 let existing = readIfExists(target)
                 let merged = try mergedContent(for: edit, target: target, existing: existing, adapterID: plan.adapterID)
 
-                let tempPath = (target as NSString).deletingLastPathComponent + "/" + Self.tempPrefix + UUID()
-                    .uuidString
                 guard let data = merged.data(using: .utf8) else {
                     throw IntegrationInstallError.validationFailed(
                         path: target,
                         diagnostic: "content is not valid UTF-8"
                     )
                 }
-
-                // Staging write only; atomicity comes from the final POSIX rename.
-                try data.write(to: URL(fileURLWithPath: tempPath))
                 let validation = syntaxValidator(merged, edit.format)
                 guard validation.isValid else {
-                    try? fileManager.removeItem(atPath: tempPath)
                     throw IntegrationInstallError.validationFailed(
                         path: target,
                         diagnostic: validation.diagnostics.joined(separator: "; ")
                     )
                 }
 
-                let permissions = previousState.first { $0.path == target }?.permissions ?? 0o644
-                try fileManager.setAttributes([.posixPermissions: permissions], ofItemAtPath: tempPath)
-                try atomicRename(tempPath, over: target)
+                try recovery.commit(data, to: target, permissions: backup.permissions(for: target), using: fileManager)
                 modifiedTargets.append(target)
             }
 
@@ -389,15 +361,15 @@ public final class IntegrationInstaller: @unchecked Sendable {
             return InstallReport(
                 outcome: upgraded ? .upgraded : .installed,
                 planDiff: planDiff,
-                backups: backups,
+                backups: backup.backupPaths,
                 fingerprintsRecorded: fingerprints.count,
                 selfTestRan: selfTest != nil
             )
         } catch {
-            // Step 10: restore backups, then restore exactly the pre-install
+            // Restore backups, then restore exactly the pre-install
             // fingerprints so uninstall keeps identifying managed entries.
             rollback(
-                previousState: previousState,
+                backup: backup,
                 adapterID: plan.adapterID,
                 previousFingerprints: previousFingerprints
             )
@@ -406,21 +378,11 @@ public final class IntegrationInstaller: @unchecked Sendable {
     }
 
     private func rollback(
-        previousState: [(path: String, existed: Bool, permissions: Int)],
+        backup: InstallerFileRecovery.Backup,
         adapterID: String,
         previousFingerprints: [ManagedEntryFingerprint]
     ) {
-        for state in previousState {
-            if state.existed {
-                let backupPath = state.path + Self.backupSuffix
-                if fileManager.fileExists(atPath: backupPath) {
-                    try? fileManager.removeItem(atPath: state.path)
-                    try? fileManager.moveItem(atPath: backupPath, toPath: state.path)
-                }
-            } else {
-                try? fileManager.removeItem(atPath: state.path)
-            }
-        }
+        backup.restore(using: fileManager)
         recording.removeAll(adapterID: adapterID)
         // Exact restore of the pre-install snapshot via the existing port —
         // never a wholesale wipe of the adapter's recorded entries. Best-
@@ -842,27 +804,8 @@ public final class IntegrationInstaller: @unchecked Sendable {
         return String(decoding: data, as: UTF8.self)
     }
 
-    /// POSIX rename(2): the true atomic rename — silently replaces any
-    /// existing destination (FileManager.moveItem refuses to).
-    private func atomicRename(_ sourcePath: String, over targetPath: String) throws {
-        guard rename(sourcePath, targetPath) == 0 else {
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [
-                NSLocalizedDescriptionKey: "rename \(sourcePath) → \(targetPath) failed"
-            ])
-        }
-    }
-
     private func writeAtomically(_ data: Data, to path: String) throws {
-        let tempPath = (path as NSString).deletingLastPathComponent + "/" + Self.tempPrefix + UUID().uuidString
-        // Staging write only; atomicity comes from the final POSIX rename.
-        try data.write(to: URL(fileURLWithPath: tempPath))
-        // The rename replaces the target inode wholesale, so the temp must
-        // carry the target's POSIX mode or a 0600 config would come back 0644
-        // after every rewrite — same preservation rule as the install path.
-        if let attributes = try? fileManager.attributesOfItem(atPath: path) {
-            try? fileManager.setAttributes(attributes, ofItemAtPath: tempPath)
-        }
-        try atomicRename(tempPath, over: path)
+        try recovery.commit(data, to: path, permissions: nil, using: fileManager)
     }
 
     static func jsonValue(at keyPath: [String], in object: [String: Any]) -> Any? {
