@@ -25,8 +25,8 @@ above are executable.
 
 AgentTerminal can keep multiple project folders as workspaces. Each workspace
 has its own agents and layout. The canvas shows at most four panes at once.
-The acceptance harness creates and tears down 16 live terminal surfaces, but
-that test result is not a general production capacity promise.
+The acceptance harness creates and tears down 16 live terminal surfaces.
+That test result is not a general production capacity promise.
 
 ## Current limits
 
@@ -40,7 +40,7 @@ that test result is not a general production capacity promise.
   Recovery Center candidates and wait for a user action.
 - The UI's Resume action runs the full relaunch path. The current control-plane
   "agentctl agent resume" endpoint validates the session and records the resume
-  event, but it is not wired to that relaunch path.
+  event. It is not wired to that relaunch path.
 - The app never auto-approves an agent permission or selection prompt. Screen
   detection marks such requests as terminal-only.
 - The release process does not yet include Sparkle, notarization, or a signed
@@ -62,8 +62,8 @@ The runtime reports one of these lifecycle values in the UI and control API:
 | "failed" | Launch failed, or the process exited with a non-zero status or signal. |
 
 The state machine also tracks process phase, attention, evidence authority, and
-state revision. Evidence authority has this order: integration, screen,
-process, then unknown. A late screen result cannot resurrect a stopped or
+state revision. Evidence authority runs from highest to lowest. Integration ranks first,
+then screen, then process, then unknown. A late screen result cannot resurrect a stopped or
 failed process.
 
 The screen detector reads the active terminal screen through libghostty rather
@@ -93,7 +93,7 @@ The package uses Swift 5.10 settings and Swift 6 upcoming-feature checks. The
 build scripts honor DEVELOPER_DIR when the active xcode-select path does
 not point to the full Xcode bundle.
 
-Install the external agent CLIs separately if you plan to use them. The New
+If you plan to use them, install the external agent CLIs separately. The New
 Agent sheet checks the executable on PATH before launch and shows an error
 when the selected CLI is missing.
 
@@ -108,11 +108,11 @@ cd agent-terminal
 just setup
 ~~~
 
-"just setup" checks for full Xcode, installs "xcodegen" through Homebrew when
-it is missing, resolves SwiftPM dependencies, and builds the pinned libghostty
-artifacts under Vendor/Ghostty/build/. It does not generate the Xcode
+"just setup" checks for full Xcode and installs "xcodegen" through Homebrew
+when it is missing. It then resolves SwiftPM dependencies and builds the
+pinned libghostty artifacts under Vendor/Ghostty/build/. It does not generate the Xcode
 project. The Ghostty script keeps its source clone outside the repository at
-~/Library/Caches/agentterminal/ghostty and bootstraps the pinned Zig version
+~/Library/Caches/agentterminal/ghostty. It bootstraps the pinned Zig version
 under ~/.local/share/agentterminal-tools/.
 
 Generate the ignored Xcode project and run the workspace from Xcode:
@@ -123,8 +123,8 @@ open AgentTerminal.xcworkspace
 ~~~
 
 Select the AgentTerminal scheme and press Cmd-R. Xcode runs the app with its
-development settings. AgentTerminalAcceptance is a separate test harness
-and is not the shipping target.
+development settings. AgentTerminalAcceptance is a separate test harness. It is not the
+shipping target.
 
 For a command-line build, use:
 
@@ -192,7 +192,7 @@ The socket is an owner-only (0600) Unix socket. There is no TCP listener.
 Use --socket PATH or AGENT_TERMINAL_CONTROL_SOCKET when running a separate
 instance or a test harness.
 
-Set CTL to the helper in the app you built, then replace the IDs with values
+Set CTL to the helper in the app you built. Replace the IDs with values
 returned by the list commands. "events subscribe" is a top-level command.
 
 ~~~sh
@@ -232,7 +232,7 @@ the receipt is cached in memory. The cache is not persisted across app runs.
 
 agent wait checks the current state, subscribes to changes, and checks the
 state again before waiting. It does not poll. Its default timeout is 60
-seconds, the maximum is 24 hours, and a timeout prints a successful JSON
+seconds. The maximum is 24 hours. A timeout prints a successful JSON
 response with reason "timeout" and exits with status 2. All other CLI
 errors exit with status 1.
 
@@ -249,7 +249,7 @@ The app stores its SQLite database at:
 
 It stores its app-specific Ghostty configuration under
 ~/Library/Application Support/AgentTerminal/ghostty/. A corrupt database is
-moved to the backups directory and replaced with a fresh database; the app
+moved to the backups directory and replaced with a fresh database. The app
 shows the quarantine path in a persistent banner.
 
 The app does not persist prompt text or terminal output. It persists workspace
@@ -289,7 +289,7 @@ just ci          # local PR gate, including package, app, and acceptance checks
 ~~~
 
 "just lint" expects swiftformat, swiftlint, and Python 3. "just setup"
-installs only xcodegen, so install the linters separately when needed:
+installs only xcodegen. Install the linters separately when needed:
 
 ~~~sh
 brew install swiftformat swiftlint
