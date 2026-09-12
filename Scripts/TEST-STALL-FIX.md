@@ -61,7 +61,8 @@ CI (`.github/workflows/ci.yml`) keeps per-target parallel workers
   return, so arming after an advance is safe as long as tests don't rely on a
   *future* virtual deadline computed from post-advance time. Keep the
   arm-before-advance pattern for any new virtual-time test.
-- Vendored libghostty lives in repo-root `Vendor/Ghostty/build/` but the
-  manifest resolves `Packages/Vendor/Ghostty`; locally a `Packages/Vendor ->
-  ../Vendor` symlink is required (untracked). CI must provision the built
-  library before `swift build` can link TerminalKit targets.
+- Vendored libghostty lives in repo-root `Vendor/Ghostty/build/`.
+  `Packages/Package.swift` resolves that path from the package directory, so no
+  `Packages/Vendor` symlink is required. CI and local builds must still
+  provision the built library before `swift build` can link TerminalKit
+  targets.

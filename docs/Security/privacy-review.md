@@ -7,10 +7,13 @@ diagnostics, or the control plane.
 
 ## 1. What leaves the machine?
 
-Nothing. AgentTerminal is a local-only application: one Unix-domain socket at
-`$TMPDIR/…/agentterminal-ctl.sock`, mode `0600` (§3.16), plus a SQLite store in
-`~/Library/Application Support/AgentTerminal/`. There are no HTTP clients, no
-telemetry, no crash-reporter uploads.
+Nothing leaves the machine during normal app operation. AgentTerminal is a
+local-only application: it uses one Unix-domain socket at
+`~/Library/Application Support/AgentTerminal/runtime/control.sock`, mode
+`0600` (§3.16), plus a SQLite store in `~/Library/Application Support/AgentTerminal/`.
+The app has no HTTP client, telemetry, or crash-reporter uploader. Setup and
+build scripts are different. They fetch SwiftPM dependencies, the pinned
+Ghostty source, and the matching Zig toolchain.
 
 Evidence: `grep -rn "URLSession\|dataTask\|NWConnection" Packages/Sources App/Sources`
 → no matches outside test fixtures.
@@ -19,7 +22,7 @@ Evidence: `grep -rn "URLSession\|dataTask\|NWConnection" Packages/Sources App/So
 
 | Surface | Guarantee | Evidence |
 |---|---|---|
-| SQLite store | Prompt text is never written; agents rows carry lifecycle tokens + opaque session references only (`AgentRow` schema, §3.14) | `grep -rn "prompt" Packages/Sources/AgentStore/Sources → only queued-prompt bookkeeping columns without text payload; EventPayloadCodec tests assert no free text |
+| SQLite store | Prompt text is never written; agent rows carry lifecycle tokens + opaque session references only (`AgentRow` schema, §3.14) | `grep -rn "prompt" Packages/Sources/AgentStore` finds only queued-prompt bookkeeping without text payload; EventPayloadCodec tests assert no free text |
 | Diagnostics bundle | `DiagnosticRedactor` scrubs env-style assignments and prompt-shaped lines before export | App/Sources/DiagnosticsExport.swift (redaction law comment, DoD #14); unit-tested in App tests |
 | DiagnosticsLogRing | Fed ONLY by explicit lifecycle sites ("NEVER fed prompts or output") | DiagnosticsExport.swift class doc; call sites audited: launch, restore, shutdown, install-recording failures |
 | Logs | `print` lines carry state transitions, pids, paths — never composer text | `grep -rn "text)" App/Sources | grep print` audit clean |

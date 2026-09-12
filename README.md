@@ -1,270 +1,320 @@
 # AgentTerminal
 
-**A native macOS app for running AI coding agents in real terminals — with a semantic layer on top.**
+AgentTerminal is a macOS app for running local coding-agent CLIs and shells in
+native terminal panes. It keeps a lifecycle record for each agent and exposes a
+local Unix-socket control API.
 
-Claude Code, Codex, OpenCode, or a plain shell each live in their own GPU-rendered
-[Ghostty](https://ghostty.org) surface inside a single native window. On top of the bytes,
-AgentTerminal maintains something terminal multiplexers never had: a **lifecycle model per agent**
-(`working`, `waitingForInput`, `idle`, …), resolved from process observation, screen detection,
-and adapter-reported evidence — so you can see *at a glance* which of your eight agents needs
-input, which finished, and which died.
+The repository is pre-release source code. It does not contain a downloadable
+app or prebuilt libghostty artifacts. The current release evidence is in
+[docs/release/stage16-gate-report.md](docs/release/stage16-gate-report.md).
 
-> **Status:** Pre-release. The core MVP is implemented and covered by package, app, and
-> acceptance tests; expect breaking changes before the first stable release. The current
-> release gate is documented in [`docs/release/stage16-gate-report.md`](docs/release/stage16-gate-report.md).
+## What it supports
 
----
+The app includes four built-in adapters:
 
-## Why
+| Adapter kind | Executable | Session resume | Lifecycle source |
+|---|---|---:|---|
+| "claude-code" | "claude" | Yes, when a session reference exists | Screen rules, with hook reports for session identity |
+| "codex" | "codex" | Yes, when a session reference exists | Screen rules, with hook reports for session identity |
+| "opencode" | "opencode" | Yes, when a session reference exists | OpenCode plugin when installed, otherwise screen rules |
+| "generic-shell" | "$SHELL", "/bin/zsh", or "/bin/bash" | No | Process monitoring and a shell-prompt screen rule |
 
-Agents already run fine in a terminal tab. What's missing is everything around them:
+The app starts the selected executable in the working folder you choose. It
+does not install these CLIs. A plain shell is available when the shell paths
+above are executable.
 
-- **You can't tell state from a wall of text.** Is the agent waiting on an approval prompt, or
-  still grinding? AgentTerminal reads the **live screen** (full scrollback-backed coordinates,
-  not whatever you scrolled into view) against versioned screen manifests, cross-checks it with
-  process inspection, and resolves conflicts through an explicit authority chain
-  (`integration › screen › process`).
-- **Prompts are fire-and-forget.** Here, one deferred prompt per agent sits in a validated
-  queue, drains only at confirmed idle, and delivery failures surface as events — never silent
-  retries, never double-send (idempotency-keyed, replay-cached).
-- **Closing things kills work.** Closing the window *parks* the surfaces and keeps every agent
-  running; quitting cleanly persists session identity so agents can be resumed later; a crash
-  recovers into a consistent state backed by SQLite.
-- **Automation has no handle.** A local CLI + Unix-socket API exposes the whole runtime:
-  create, prompt, wait (event-driven, never polling), read, focus, interrupt, stop, resume,
-  subscribe to events.
+AgentTerminal can keep multiple project folders as workspaces. Each workspace
+has its own agents and layout. The canvas shows at most four panes at once.
+The acceptance harness creates and tears down 16 live terminal surfaces, but
+that test result is not a general production capacity promise.
 
-Out of scope by design (for now): remote/SSH agents, persistent PTY after full quit, Linux/Windows,
-plugin marketplaces, auto-approving permission prompts. The full boundary is §3.1 of the
-[architecture notes](docs/Architecture/).
+## Current limits
 
-## Features
+- The app supports local macOS processes only. There is no remote or SSH agent
+  support, and there are no Linux or Windows targets.
+- Closing a pane or the window parks the terminal surface. It does not stop the
+  child process. Use Stop Agent or quit with the stop option to terminate work.
+- A clean quit can request resume for Claude Code, Codex, and OpenCode when the
+  adapter captured a valid session reference. A generic shell cannot resume.
+- A crash does not auto-start previous agents. Recoverable sessions become
+  Recovery Center candidates and wait for a user action.
+- The UI's Resume action runs the full relaunch path. The current control-plane
+  "agentctl agent resume" endpoint validates the session and records the resume
+  event, but it is not wired to that relaunch path.
+- The app never auto-approves an agent permission or selection prompt. Screen
+  detection marks such requests as terminal-only.
+- The release process does not yet include Sparkle, notarization, or a signed
+  distribution package.
 
-- **Workspaces** — one project = one workspace; sidebar navigation across all its agents.
-- **Real terminals** — [libghostty](Vendor/Ghostty/README.md)-owned PTYs, pinned to an upstream
-  commit, isolated behind our own C bridge; up to 4 visible split panes, 16 live terminals,
-  plus fully headless background agents.
-- **Lifecycle engine** — typed state machine with authority resolution, turn tracking,
-  attention states (`inputRequired`, `completionUnread`, `failure`) driving notifications and
-  sidebar badges.
-- **Safe prompting** — policies per send: `sendNow`, `queueWhenIdle`, `rejectUnlessIdle`;
-  watchdog-guarded delivery.
-- **Session resume** — adapters mint resume references at exit; restart the conversation, not
-  just the process.
-- **Local control plane** — NDJSON over a `0600` Unix socket, closed 18-method v1 contract with
-  mandatory version field and exactly-once prompt delivery.
-- **Hooks & integrations** — per-generation scoped launch tokens; `integration report/release`
-  feed external lifecycle evidence into the same authority pipeline.
+## How lifecycle state works
 
-## Architecture
+The runtime reports one of these lifecycle values in the UI and control API:
 
-Single process, five layers, one dependency law:
+| State | Meaning |
+|---|---|
+| "unknown" | No current trusted evidence exists, or screen rules conflict. |
+| "starting" | The agent record exists and its terminal launch is in progress, or the process has started but has not produced a lifecycle observation. |
+| "idle" | The integration or screen rules identify an idle prompt. |
+| "working" | The integration or screen rules identify an active turn. |
+| "waitingForInput" | The agent is waiting for a question, approval, or selection response. |
+| "stopping" | A graceful stop was requested and the process has not exited yet. |
+| "stopped" | The process exited successfully, either after a user stop or after completing on its own. |
+| "failed" | Launch failed, or the process exited with a non-zero status or signal. |
 
-```text
-┌─────────────────────────────────────────────────────────────────┐
-│ AgentTerminal.app                                               │
-│                                                                 │
-│  ┌────────────────────── Native UI ───────────────────────────┐ │
-│  │ Sidebar │ Split Canvas │ Inspector │ Prompt Composer       │ │
-│  └────────────────────────────┬────────────────────────────────┘ │
-│                               │ MainActor                        │
-│                     ┌─────────▼──────────┐                       │
-│                     │ AppModel           │                       │
-│                     │ UI projection only │                       │
-│                     └─────────▲──────────┘                       │
-│                               │ RuntimeDelta                     │
-│  ┌────────────────────────────┴────────────────────────────────┐ │
-│  │ AgentRuntime actor                                          │ │
-│  │ state machine │ authority │ prompt queue │ turn tracking    │ │
-│  └───────┬─────────────────┬───────────────────────┬───────────┘ │
-│          ▼                 ▼                       ▼             │
-│  TerminalControlling   DetectionEngine        StateStore         │
-│          ▼                 ▼                       ▼             │
-│  GhosttyEngine         Process/screen        SQLite (GRDB)       │
-│          ▼              observations                            │
-│  Pinned libghostty → PTYs/processes                             │
-│                                                                 │
-│  ControlServer actor ← Unix socket → agentctl / hooks           │
-└─────────────────────────────────────────────────────────────────┘
-```
+The state machine also tracks process phase, attention, evidence authority, and
+state revision. Evidence authority has this order: integration, screen,
+process, then unknown. A late screen result cannot resurrect a stopped or
+failed process.
 
-Modules and the dependency law enforced by
-[`Scripts/check-dependency-law.py`](Scripts/check-dependency-law.py):
+The screen detector reads the active terminal screen through libghostty rather
+than an OS screenshot. Bundled manifests cover Claude Code, Codex, and
+OpenCode. An unmatched or ambiguous screen becomes "unknown". The detector
+confirms a waiting state on two matching observations and stabilizes an
+idle-after-working result before publishing it. See
+[docs/Detection/manifests.md](docs/Detection/manifests.md) for the exact
+rules and fixtures.
 
-| Module | Depends on | Role |
-|---|---|---|
-| `AgentCore` | Foundation only | Domain model, runtime, detection, state machine |
-| `AgentStore` | AgentCore + GRDB | Durable metadata, timeline, migrations |
-| `AgentControl` | AgentCore | Wire types, socket server/client, hook auth |
-| `TerminalKit` | AgentCore + AppKit + GhosttyBridge | Session manager, surfaces, teardown |
-| `GhosttyBridge` | C | The only place that imports `ghostty.h` |
-| `AgentLauncher`, `agentctl` | AgentControl only, no AppKit | Helper executables shipped in `Contents/Helpers` |
-| App target | all modules | Composition root, scenarios |
+Attention is separate from lifecycle. The app can mark an agent as
+"inputRequired", "completionUnread", or "failure". A hidden agent that finishes
+a turn can raise "completionUnread". The sidebar and menu-bar status item keep
+showing attention when macOS notification authorization is unavailable.
 
-Forbidden edges are checked in CI: no AppKit/libghostty/GRDB below their layer, no raw
-`ghostty_surface_t` above TerminalKit, C callbacks never touch UI or domain state directly.
+## Prerequisites
 
-Design decisions and their reasoning live in the ADRs
-([single-process MVP](docs/Architecture/ADR-0001-single-process-mvp.md),
-[libghostty boundary](docs/Architecture/ADR-0002-libghostty-boundary.md),
-[agent lifecycle](docs/Architecture/ADR-0003-agent-lifecycle.md)) and the
-[deviations ledger](docs/Architecture/deviations.md).
-The wire contract is specified in [`docs/Protocols/control-v1.md`](docs/Protocols/control-v1.md);
-detection manifests in [`docs/Detection/manifests.md`](docs/Detection/manifests.md).
+You need:
 
-## Getting started
+- an Apple Silicon Mac running macOS 14 or newer;
+- full Xcode 16.4 or newer, not only the Xcode Command Line Tools;
+- Homebrew to install "just" and, when needed, "xcodegen";
+- network access during setup to resolve GRDB, clone the pinned Ghostty
+  revision, and download the exact Zig version used by that revision.
 
-Requirements: macOS 14+ on Apple Silicon, full Xcode 16.4+, and Homebrew. If
-`xcode-select -p` points at the Command Line Tools rather than full Xcode,
-set `DEVELOPER_DIR` to the selected Xcode bundle before the `xcodebuild`/SwiftLint
-invocations below (`setup-dev.sh` also honors this variable).
+The package uses Swift 5.10 settings and Swift 6 upcoming-feature checks. The
+build scripts honor DEVELOPER_DIR when the active xcode-select path does
+not point to the full Xcode bundle.
 
-```sh
+Install the external agent CLIs separately if you plan to use them. The New
+Agent sheet checks the executable on PATH before launch and shows an error
+when the selected CLI is missing.
+
+## Build and run
+
+Install "just", clone the repository, and run the setup script:
+
+~~~sh
 brew install just
 git clone https://github.com/artur-shlyapnikov/agent-terminal.git
 cd agent-terminal
-just setup                 # xcodegen, SwiftPM resolve, and pinned libghostty
-```
+just setup
+~~~
 
-(`just setup` is `./Scripts/setup-dev.sh`. `just --list` shows all recipes;
-the `justfile` mirrors the Development section and `.github/workflows/ci.yml`.)
+"just setup" checks for full Xcode, installs "xcodegen" through Homebrew when
+it is missing, resolves SwiftPM dependencies, and builds the pinned libghostty
+artifacts under Vendor/Ghostty/build/. It does not generate the Xcode
+project. The Ghostty script keeps its source clone outside the repository at
+~/Library/Caches/agentterminal/ghostty and bootstraps the pinned Zig version
+under ~/.local/share/agentterminal-tools/.
 
-Then either open the workspace:
+Generate the ignored Xcode project and run the workspace from Xcode:
 
-```sh
-just gen                   # regenerate AgentTerminal.xcodeproj from App/project.yml
+~~~sh
+just gen
 open AgentTerminal.xcworkspace
-# select the AgentTerminal scheme, Cmd-R
-```
+~~~
 
-or build from the terminal:
+Select the AgentTerminal scheme and press Cmd-R. Xcode runs the app with its
+development settings. AgentTerminalAcceptance is a separate test harness
+and is not the shipping target.
 
-```sh
-just app                   # full app build (CODE_SIGNING_ALLOWED=NO)
-```
+For a command-line build, use:
 
-The first build provisions `Vendor/Ghostty/build/` (gitignored; cached per pin in CI).
-Details on the pin policy, zig provenance, and how to bump the commit:
-[`Vendor/Ghostty/README.md`](Vendor/Ghostty/README.md).
+~~~sh
+just app
+~~~
 
-The repository does not ship prebuilt binaries yet. `just app` creates an
-unsigned development build; sign it with a local identity using
-`just sign path/to/AgentTerminal.app`, or open the generated project in Xcode.
+This recipe regenerates the Xcode project and builds an unsigned app with
+CODE_SIGNING_ALLOWED=NO. It does not start the app and it does not build
+libghostty. Run "just setup" first, or run "just ghostty" when the vendored
+build is missing.
 
-### Driving agents from the CLI
+If the selected developer directory is not full Xcode, set it for the recipe:
 
-With the app running, `agentctl` — shipped inside the app bundle at
-`Contents/Helpers/agentctl` — talks to the control socket at
-`~/Library/Application Support/AgentTerminal/runtime/control.sock`:
+~~~sh
+DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer just app
+~~~
 
-```sh
-agentctl system ping
-agentctl workspace list
-agentctl agent create --workspace "$WS" --kind claude-code --dir ~/src/api --name "API migration"
-agentctl agent list
+To build and run with a predictable output directory, use the same command
+shape as CI:
 
-# Send a task; retries are safe — commandID replays the cached receipt.
-agentctl agent prompt "$AGENT" "Refactor the auth module to async/await" --policy sendNow
+~~~sh
+just gen
+xcodebuild -workspace AgentTerminal.xcworkspace -scheme AgentTerminal -destination 'platform=macOS,arch=arm64' -derivedDataPath /tmp/agent-terminal-derived-data build CODE_SIGNING_ALLOWED=NO
+open /tmp/agent-terminal-derived-data/Build/Products/Debug/AgentTerminal.app
+~~~
 
-# Event-driven wait: blocks on a state transition, never polls.
-agentctl agent wait "$AGENT" --lifecycle idle --timeout-ms 300000
+## First run
 
-agentctl agent read "$AGENT" --source detection   # what the detector sees
-agentctl agent focus "$AGENT"                      # bring its surface frontmost
-agentctl agent interrupt "$AGENT"                  # SIGINT-equivalent: end the running turn
-agentctl events subscribe                          # stream all deltas until Ctrl-C
-agentctl agent stop "$AGENT"                       # SIGTERM group → grace → SIGKILL
-```
+1. Launch AgentTerminal. On a fresh database, the onboarding window lists
+   detected agent CLIs.
+2. Choose a project folder. "Skip" creates a workspace rooted at your home
+   directory and still lets you start a plain shell.
+3. Press Cmd-N or choose File > New Agent. Select an adapter, enter a display
+   name, choose a working folder, and create the agent. The display name and
+   working folder are required. A task summary is optional.
+4. Select the new agent in the sidebar and type a prompt in the composer. For
+   an approval or selection request, answer in the terminal pane.
+5. Cmd-W or Close View parks the selected pane. The process continues and the
+   agent remains in the sidebar. Use Agent > Stop Agent to send a graceful
+   stop. The stop path sends SIGTERM to the process group, waits two seconds,
+   then sends SIGKILL if the process is still alive.
 
-Beyond these: `agent get`, `agent resume`, `agent cancel-queued-prompt`,
-`integration report/release`, `launcher`.
-Full method reference: [`docs/Protocols/control-v1.md`](docs/Protocols/control-v1.md).
+The first-run window also links to integration settings. The installer can
+manage its own entries in these files:
 
-## Development
+- ~/.claude/settings.json;
+- ~/.codex/config.toml;
+- ~/.config/opencode/config.json.
 
-`just` recipes are the canonical entry points (raw commands underneath still work):
+It validates the file format, creates a backup before changing an existing
+file, and refuses to overwrite a user-modified managed entry. Integration
+setup does not install or update the external CLIs.
 
-```sh
-just check                 # package build + dependency and license gates
-just build                 # cd Packages && swift build (canonical root Packages/.build)
-just test                  # package suite, parallel; filter: just test PromptWatchdog
-just strict                # warnings-as-errors gate (CI packages job)
-just app                   # full app build (implies just gen)
-just app-test              # app-hosted unit tests (App/Tests, TEST_HOST = app bundle)
-just lint                  # swiftformat --lint + swiftlint + dependency law + license audit
-just format                # in-place canonical formatting
-just law                   # python3 Scripts/check-dependency-law.py (import-graph gate)
-just licenses              # ./Scripts/verify-third-party-licenses.sh (license audit gate)
-just smoke                 # fast scenario smoke subset (corrupt-db, capacity16, teardown100)
-just soak 60               # full soak harness (default 1800 s); CI never runs the full soak
-just ci                    # local PR gate: lint + test + strict + app + app-test + acceptance
-```
+## Control the app with agentctl
 
-The app also ships hermetic **scenario harnesses** used by CI's smoke stage — they exercise
-real product paths headlessly (`App/Acceptance/Stage16GatesScenario.swift`):
+The app bundle contains Contents/Helpers/agentctl. The control server starts
+with the app when bootstrap succeeds. Its default socket is:
 
-```sh
-ATERM_SCENARIO=corrupt-db   ATERM_DB_PATH=/tmp/t.sqlite3 AgentTerminalAcceptance.app/Contents/MacOS/AgentTerminalAcceptance
-ATERM_SCENARIO=capacity16   ...   # 16 surfaces alive and responsive, clean teardown
-ATERM_SCENARIO=teardown100  ...   # 100 create/free cycles, stable footprint
-ATERM_SCENARIO=soak         ATERM_SOAK_SECONDS=1800 ...
-ATERM_SCENARIO=broken-hooks ...   # broken hook shim → degraded banner, Repair restores, fallback detection
-ATERM_SCENARIO=upgrade-sim  ...   # 'newer' helper version marker → launch proceeds, detection marked fallback
-```
+~~~text
+~/Library/Application Support/AgentTerminal/runtime/control.sock
+~~~
 
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) gates every PR on: SwiftFormat +
-SwiftLint (zero warnings), dependency law, license audit, gitleaks history scan, the full SwiftPM
-suite with warnings-as-errors, and an XcodeGen + app build with the scenario smoke subset.
-A nightly job ([`nightly-tsan.yml`](.github/workflows/nightly-tsan.yml), `just tsan`) runs
-Thread Sanitizer (serial by design, 5–15× slower, not part of PR CI).
+The socket is an owner-only (0600) Unix socket. There is no TCP listener.
+Use --socket PATH or AGENT_TERMINAL_CONTROL_SOCKET when running a separate
+instance or a test harness.
 
-Engineering conventions: Swift 5.10 language mode with Swift 6 upcoming-feature strictness on every
-target (`AgentCore` pilots `-strict-concurrency=complete`); canonical formatting via `.swiftformat`
-with blame-ignore sweeps; hardened runtime enabled, user script sandboxing on.
+Set CTL to the helper in the app you built, then replace the IDs with values
+returned by the list commands. "events subscribe" is a top-level command.
+
+~~~sh
+CTL="/path/to/AgentTerminal.app/Contents/Helpers/agentctl"
+
+"$CTL" system ping
+"$CTL" workspace list
+
+WORKSPACE_ID="paste-a-workspace-id"
+"$CTL" agent create --workspace "$WORKSPACE_ID" --kind claude-code --dir "$PWD" --name "API migration"
+"$CTL" agent list --workspace "$WORKSPACE_ID"
+
+AGENT_ID="paste-an-agent-id"
+"$CTL" agent prompt "$AGENT_ID" "Refactor the auth module" --policy sendNow
+"$CTL" agent wait "$AGENT_ID" --lifecycle idle --timeout-ms 300000
+"$CTL" agent read "$AGENT_ID" --source detection
+"$CTL" events subscribe --agent "$AGENT_ID"
+"$CTL" agent stop "$AGENT_ID"
+~~~
+
+The user-facing commands are system ping, workspace list, and the agent
+actions create, list, get, prompt, cancel-queued-prompt, focus, read, wait,
+interrupt, stop, and resume. integration and launcher commands are
+authenticated protocol paths used by installed hooks and the bundled launcher.
+
+agent prompt accepts these policies:
+
+- sendNow writes to the terminal immediately when the current lifecycle allows
+  the prompt and a terminal is available;
+- queueWhenIdle keeps one prompt per supported agent until a validated "idle"
+  state. Generic shells do not support this policy;
+- rejectUnlessIdle fails unless the lifecycle is already "idle".
+
+The queue is one slot. A second queued prompt fails instead of replacing the
+first one. A prompt with a client --command-id can be retried safely because
+the receipt is cached in memory. The cache is not persisted across app runs.
+
+agent wait checks the current state, subscribes to changes, and checks the
+state again before waiting. It does not poll. Its default timeout is 60
+seconds, the maximum is 24 hours, and a timeout prints a successful JSON
+response with reason "timeout" and exits with status 2. All other CLI
+errors exit with status 1.
+
+The full NDJSON envelope, method list, error codes, and authenticated hook
+fields are in [docs/Protocols/control-v1.md](docs/Protocols/control-v1.md).
+
+## Storage, permissions, and privacy
+
+The app stores its SQLite database at:
+
+~~~text
+~/Library/Application Support/AgentTerminal/AgentTerminal.sqlite
+~~~
+
+It stores its app-specific Ghostty configuration under
+~/Library/Application Support/AgentTerminal/ghostty/. A corrupt database is
+moved to the backups directory and replaced with a fresh database; the app
+shows the quarantine path in a persistent banner.
+
+The app does not persist prompt text or terminal output. It persists workspace
+and agent metadata, lifecycle history, layout, and opaque session references.
+
+App/AgentTerminal.entitlements contains no App Sandbox or JIT entitlement.
+The project enables Hardened Runtime. The app can therefore launch local
+CLIs and access the working folders selected by the user, subject to normal
+macOS privacy controls for protected locations. The app does not use Screen
+Recording or Accessibility APIs for lifecycle detection. It reads the
+terminal buffer through libghostty.
+
+The app requests macOS alert and sound notification authorization during an
+interactive launch. Denying it does not disable agents or the control API.
+The sidebar and menu-bar status item still show attention. The app sources do
+not contain an HTTP client or telemetry uploader. Setup scripts do use the
+network to fetch dependencies and the pinned Ghostty toolchain.
+
+See [docs/Security/privacy-review.md](docs/Security/privacy-review.md) and
+[docs/Security/threat-model.md](docs/Security/threat-model.md) for the
+security boundaries.
+
+## Development checks
+
+The justfile is the canonical list of local recipes. Common checks are:
+
+~~~sh
+just check       # package build, dependency-law check, and license audit
+just build       # SwiftPM package build
+just test        # SwiftPM tests
+just strict      # package build with warnings as errors
+just app-test    # app-hosted unit tests
+just lint        # SwiftFormat, SwiftLint, dependency law, and license audit
+just smoke       # corrupt-db, capacity16, and teardown100 scenarios
+just soak 60     # short soak; the default is 1800 seconds
+just ci          # local PR gate, including package, app, and acceptance checks
+~~~
+
+"just lint" expects swiftformat, swiftlint, and Python 3. "just setup"
+installs only xcodegen, so install the linters separately when needed:
+
+~~~sh
+brew install swiftformat swiftlint
+~~~
+
+"just format" changes Swift source files in place. The acceptance app and
+scenario harnesses are for repository checks, not normal app use.
 
 ## Repository layout
 
-```text
-justfile             task runner (mirrors Development + CI)
-App/                 macOS app target (XcodeGen spec, sources, entitlements)
-  Sources/                   composition root, UI, scenario harnesses
-  Acceptance/                hermetic Stage-16 scenario gates (ATERM_SCENARIO=…)
-  Support/                   Info.plist
-  Tests/                     app-hosted unit tests (TEST_HOST = the app bundle)
-Packages/            SwiftPM package — all reusable modules + their tests
-  Sources/AgentCore/         domain, runtime, detection
-  Sources/AgentStore/        SQLite/GRDB persistence
-  Sources/AgentControl/      socket server, wire protocol
-  Sources/TerminalKit/       session/surface management
-  Sources/GhosttyBridge/     the only importer of ghostty.h
-  Sources/AgentLauncher/     launch helper
-  Sources/agentctl/          CLI
-  Tests/                     package test suites
-Tests/Fixtures/      shared detection fixtures consumed by package tests
-Vendor/Ghostty/      pinned libghostty: commit.txt, patches.md, build script
-Scripts/             dev bootstrap, gates, release signing
-docs/                architecture, ADRs, protocols, threat model, privacy review
-Spike/               throwaway experiments
-```
+~~~text
+App/                 macOS app target, XcodeGen spec, UI, and app tests
+Packages/            SwiftPM modules and package tests
+Tests/Fixtures/      anonymized screen-detection fixtures
+Vendor/Ghostty/      pinned commit metadata and build instructions
+Scripts/             setup, Ghostty build, checks, and signing scripts
+docs/                architecture, detection, protocol, security, and release notes
+~~~
 
-## Security posture
-
-Threat model assumes a trusted local user; the control socket is owner-only (`0600`) AF_UNIX —
-there is deliberately no TCP listener anywhere. Launch tickets carry ephemeral per-generation
-tokens so a stale helper cannot impersonate a restarted agent. Hardened Runtime is enabled;
-the App Sandbox is intentionally off (the app manages arbitrary project directories).
-Read the analysis: [`docs/Security/threat-model.md`](docs/Security/threat-model.md),
-[`docs/Security/privacy-review.md`](docs/Security/privacy-review.md).
-Third-party components and licenses: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
-
-## Acknowledgments
-
-Built on [Ghostty](https://ghostty.org) (MIT) via its embedder API, [GRDB](https://github.com/groue/GRDB.swift),
-and ideas borrowed from Herdr's semantic-agent model (Apache-2.0). The architecture doc records
-what was taken, what was rejected, and why.
+Architecture decisions are in [docs/Architecture/](docs/Architecture/).
+The Ghostty pin and build details are in
+[Vendor/Ghostty/README.md](Vendor/Ghostty/README.md).
 
 ## License
 
-AgentTerminal is released under the MIT License. The repository also contains
-third-party components with their own terms; see [`LICENSE`](LICENSE) and
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) before redistributing source or binaries.
+AgentTerminal is released under the MIT License. Third-party components keep
+their own terms. See [LICENSE](LICENSE) and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
