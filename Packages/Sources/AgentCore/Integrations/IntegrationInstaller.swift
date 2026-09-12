@@ -774,7 +774,6 @@ public final class IntegrationInstaller: @unchecked Sendable {
             let base = existing ?? ""
             let desired = Self.renderTOMLManagedBlock(entries: edit.entries, adapterID: adapterID)
             if let block = existing.flatMap({ Self.extractManagedBlock(in: $0, adapterID: adapterID) }) {
-                let base = existing ?? ""
                 return base.replacingOccurrences(of: block.text, with: desired)
             }
             var result = base
