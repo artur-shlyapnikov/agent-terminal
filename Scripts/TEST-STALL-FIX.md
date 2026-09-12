@@ -5,7 +5,7 @@
 `swift test` over the whole AgentTerminal package reproducibly suspended
 mid-run (observed at `PromptWatchdogTests.testTimeoutAfterFiveSecondsWithoutSignals`;
 an earlier run wedged inside `PromptQueueTests`). Every suite passed in
-isolation, which pointed at cross-suite interference — it wasn't.
+isolation. That result did not indicate cross-suite interference.
 
 ## Root cause
 
@@ -21,18 +21,18 @@ concurrency actor-isolation rules:
 3. When `watch` finally ran, `deadline = clock.now + .seconds(5)` was computed
    from the already-advanced clock (~5 s), so its sleeper deadline landed at
    ~10 s of virtual time that nobody would ever advance to.
-4. The test then awaited `watchTask.value` forever; XCTest's async-test waiter
-   parked the main thread in a runloop wait (`XCTWaiter _performWait` →
-   `CFRunLoopRunSpecific` → `mach_msg`), freezing the whole xctest worker and,
-   with it, the parallel full-suite run.
+4. The test then awaited `watchTask.value` forever. XCTest's async-test waiter
+   parked the main thread in a runloop wait (`XCTWaiter _performWait`,
+   `CFRunLoopRunSpecific`, and `mach_msg`). This froze the whole xctest worker
+   and the parallel full-suite run.
 
-Sampling evidence (`sample <wedged xctest pid>`): main thread parked in
-mach_msg inside XCTWaiter's runloop; no cooperative-pool progress; the armed
-sleeper waiting for a virtual instant that never arrives.
+Sampling evidence (`sample <wedged xctest pid>`): the main thread parked in
+mach_msg inside XCTWaiter's runloop. The cooperative pool made no progress. The
+armed sleeper waited for a virtual instant that never arrived.
 
-Isolation runs passed only when timing happened to let `watch` arm before the
-first `advance` — never guaranteed once hundreds of prior tests had warmed the
-process, hence "passes alone, hangs in the full suite".
+Isolation runs passed when timing let `watch` arm before the first `advance`.
+That timing was not guaranteed after hundreds of earlier tests had warmed the
+process. The result was "passes alone, hangs in the full suite".
 
 ## Fix (test-side)
 

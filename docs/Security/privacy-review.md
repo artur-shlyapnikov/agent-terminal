@@ -1,4 +1,4 @@
-# Privacy Review — §3.20 checklist (stage-16 gate 7)
+# Privacy review: §3.20 checklist (stage-16 gate 7)
 
 Status: **reviewed for the stage-16 release gate**. Evidence pointers are grep
 audits over the current tree; each item lists where the guarantee lives and how
@@ -16,7 +16,7 @@ build scripts are different. They fetch SwiftPM dependencies, the pinned
 Ghostty source, and the matching Zig toolchain.
 
 Evidence: `grep -rn "URLSession\|dataTask\|NWConnection" Packages/Sources App/Sources`
-→ no matches outside test fixtures.
+found no matches outside test fixtures.
 
 ## 2. Prompts must not be persisted or logged
 
@@ -24,8 +24,8 @@ Evidence: `grep -rn "URLSession\|dataTask\|NWConnection" Packages/Sources App/So
 |---|---|---|
 | SQLite store | Prompt text is never written; agent rows carry lifecycle tokens + opaque session references only (`AgentRow` schema, §3.14) | `grep -rn "prompt" Packages/Sources/AgentStore` finds only queued-prompt bookkeeping without text payload; EventPayloadCodec tests assert no free text |
 | Diagnostics bundle | `DiagnosticRedactor` scrubs env-style assignments and prompt-shaped lines before export | App/Sources/DiagnosticsExport.swift (redaction law comment, DoD #14); unit-tested in App tests |
-| DiagnosticsLogRing | Fed ONLY by explicit lifecycle sites ("NEVER fed prompts or output") | DiagnosticsExport.swift class doc; call sites audited: launch, restore, shutdown, install-recording failures |
-| Logs | `print` lines carry state transitions, pids, paths — never composer text | `grep -rn "text)" App/Sources | grep print` audit clean |
+| DiagnosticsLogRing | Receives entries only from explicit lifecycle sites. It never receives prompts or output. | DiagnosticsExport.swift class doc; call sites audited: launch, restore, shutdown, install-recording failures |
+| Logs | `print` lines carry state transitions, pids, and paths. They never carry composer text. | `grep -rn "text)" App/Sources | grep print` audit clean |
 
 ## 3. Environment variables must not be persisted or logged
 
@@ -37,11 +37,12 @@ scrubs `VAR=value` shapes from exported lines
 
 ## 4. Terminal output must not be persisted
 
-Screen snapshots live only in engine memory; the detection pipeline evaluates
-them in-process and forwards LIFECYCLE verdicts (never text) to the runtime.
+Screen snapshots live only in engine memory. The detection pipeline evaluates
+them in-process and forwards LIFECYCLE verdicts, never text, to the runtime.
 The SQLite schema has no output column (§3.14 table set).
 
-Evidence: `grep -rn "output\|snapshot" Packages/Sources/AgentStore → no schema/storage hits`;
+Evidence: `grep -rn "output\|snapshot" Packages/Sources/AgentStore` found no
+schema or storage hits.
 DetectionPipeline ingests `.screen(payload)` with rule IDs only.
 
 ## 5. Access control on IPC
@@ -49,16 +50,16 @@ DetectionPipeline ingests `.screen(payload)` with rule IDs only.
 - Socket: mode-checked `0600` at accept time; protocol handshake requires
   `protocolVersion == 1`.
 - Hook reports: per-process-generation random token (`HookAuthenticator`,
-  §3.16); wrong/stale token → `unauthorized` / `staleGeneration`.
+  §3.16); wrong or stale tokens return `unauthorized` or `staleGeneration`.
 - Threat model boundary: trusted local user (docs/Security/threat-model.md).
 
 ## 6. Data minimization in persisted installs
 
-Integration fingerprints record LOCATION IDENTITY + generated boilerplate
-content only (`ManagedEntryFingerprint`) — never user file content beyond our
-own managed sections. The diagnostics exporter prints paths and marker
-presence, not content (DiagnosticsExport.swift "Managed CONTENT is
-AgentTerminal-generated boilerplate").
+Integration fingerprints record location identity and generated boilerplate
+content only (`ManagedEntryFingerprint`). They never record user file content
+beyond the managed sections. The diagnostics exporter prints paths and marker
+presence, not content (DiagnosticsExport.swift says managed content is
+AgentTerminal-generated boilerplate).
 
 ## 7. Retention & deletion
 
@@ -68,7 +69,7 @@ can delete them deliberately; nothing else outlives the workspace.
 
 ## 8. Known residual risks
 
-1. `agentctl` CLI output includes agent summaries (state, cwd) — acceptable:
-   same Unix user already owns these processes (threat model).
-2. Crash logs (OS-level) may include stack frames — standard macOS behavior,
-   no prompt content is ever passed into crashing APIs.
+1. `agentctl` CLI output includes agent summaries (state, cwd). This is
+   acceptable because the same Unix user already owns these processes.
+2. OS crash logs may include stack frames. This is standard macOS behavior, and
+   no prompt content is passed into crashing APIs.

@@ -84,7 +84,7 @@ showing attention when macOS notification authorization is unavailable.
 You need:
 
 - an Apple Silicon Mac running macOS 14 or newer;
-- full Xcode 16.4 or newer, not only the Xcode Command Line Tools;
+- full Xcode 16.4 or newer. The Xcode Command Line Tools package is insufficient;
 - Homebrew to install "just" and, when needed, "xcodegen";
 - network access during setup to resolve GRDB, clone the pinned Ghostty
   revision, and download the exact Zig version used by that revision.
