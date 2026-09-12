@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+# control-aterm — hermetic driver for AgentTerminal verification runs.
+# Every instance is isolated by RUN_ID: its own socket, database, ghostty
+# config, work dir, and evidence dir under /tmp/aterm-verify-<RUN_ID>/.
+# It NEVER touches the production paths (~/Library/Application
+# Support/AgentTerminal/...) and NEVER drives an instance it did not start.
+set -euo pipefail
+
+DEFAULT_APP="/tmp/aterm-verify-dd/Build/Products/Debug/AgentTerminal.app"
+FALLBACK_CTL="Packages/.build/arm64-apple-macosx/debug/agentctl"
+
+usage() {
+  cat <<'EOF'
+usage: control-aterm --run-id ID <command> [args...]
+  --run-id ID | --run-id=ID     hermetic instance identity (required;
+                                or set ATERM_RUN_ID). Only [A-Za-z0-9_-].
+  --app PATH                    AgentTerminal.app bundle (or ATERM_APP).
+                                Default: /tmp/aterm-verify-dd/Build/Products/Debug/AgentTerminal.app
+  --ctl PATH                    agentctl binary (or ATERM_CTL).
+                                Default: <app>/Contents/MacOS/Helpers/agentctl,
+                                fallback: Packages/.build/arm64-apple-macosx/debug/agentctl
+
+commands:
+  launch                        start the hermetic app, wait for ready, print paths
+  doctor                        read-only health check (is this instance worth driving?)
+  ping                          agentctl system ping
+  workspaces                    agentctl workspace list
+  create --workspace ID --kind K --dir PATH --name NAME [--task-summary S]
+  list [--workspace ID]         agentctl agent list
+  get AGENT_ID                  agentctl agent get
+  prompt AGENT_ID TEXT... [--policy P] [--command-id UUID]
+  wait AGENT_ID --lifecycle L[,L...] [--min-revision N] [--timeout-ms N]
+  read AGENT_ID [--source visible|detection]
+  focus|interrupt|resume|cancel-queued-prompt AGENT_ID
+  stop AGENT_ID [--mode gracefulStop|closeView]
+  subscribe [--agent AGENT_ID]   stream NDJSON events until Ctrl-C
+  evidence-dir                  print the proof-artifact directory (survives cleanup)
+  cleanup                       stop the app WE started, remove scratch, keep evidence
+EOF
+}
+
+RUN_ID="${ATERM_RUN_ID:-}"
+APP="${ATERM_APP:-$DEFAULT_APP}"
+CTL_OVERRIDE="${ATERM_CTL:-}"
+
+# --- global flag parsing: leading flags only; stop at the command word ---
+# Everything from the command on is passed through verbatim so agentctl
+# subcommand flags (--workspace, --lifecycle, ...) are never mistaken for
+# helper options.
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --run-id) RUN_ID="${2:?--run-id needs a value}"; shift 2 ;;
+    --run-id=*) RUN_ID="${1#--run-id=}"; shift ;;
+    --app) APP="$2"; shift 2 ;;
+    --app=*) APP="${1#--app=}"; shift ;;
+    --ctl) CTL_OVERRIDE="$2"; shift 2 ;;
+    --ctl=*) CTL_OVERRIDE="${1#--ctl=}"; shift ;;
+    -h|--help|help) usage; exit 0 ;;
+    --) shift; break ;;
+    --*) break ;;
+    *) break ;;  # command word: the rest passes through verbatim
+  esac
+done
+
+[[ -n "$RUN_ID" ]] || { echo "[control-aterm] --run-id ID (or ATERM_RUN_ID) is required" >&2; exit 1; }
+[[ "$RUN_ID" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "[control-aterm] bad --run-id '$RUN_ID' ([A-Za-z0-9_-] only)" >&2; exit 1; }
+
+RUN_DIR="/tmp/aterm-verify-${RUN_ID}"
+SOCK="$RUN_DIR/control.sock"
+DB="$RUN_DIR/verify.sqlite"
+GHOSTTY_DIR="$RUN_DIR/ghostty"
+WORK_DIR="$RUN_DIR/work"
+ZDOTDIR_RUN="$RUN_DIR/zdotdir"
+EVIDENCE_DIR="$RUN_DIR/artifacts"
+APP_LOG="$RUN_DIR/app.log"
+APP_PID_FILE="$RUN_DIR/app.pid"
+
+resolve_ctl() {
+  if [[ -n "$CTL_OVERRIDE" ]]; then
+    echo "$CTL_OVERRIDE"
+  elif [[ -x "$APP/Contents/MacOS/Helpers/agentctl" ]]; then
+    echo "$APP/Contents/MacOS/Helpers/agentctl"
+  else
+    echo "$FALLBACK_CTL"
+  fi
+}
+
+# Refuse to drive anything that is not OUR hermetic socket. An unset or
+# production socket means "do not touch the user's live session".
+assert_hermetic() {
+  [[ "$SOCK" == /tmp/aterm-verify-*/control.sock ]] || {
+    echo "[control-aterm] refusing: socket '$SOCK' is not a hermetic verification socket" >&2; exit 1
+  }
+}
+
+start_app() {
+  # Hermetic launch: private socket + database + ghostty config. Production
+  # ~/Library/... paths are untouched while these overrides are set.
+  AGENT_TERMINAL_CONTROL_SOCKET="$SOCK" \
+  ATERM_DB_PATH="$DB" \
+  ATERM_GHOSTTY_CONFIG_DIR="$GHOSTTY_DIR" \
+  ZDOTDIR="$ZDOTDIR_RUN" \
+  nohup "$APP/Contents/MacOS/AgentTerminal" >>"$APP_LOG" 2>&1 &
+  echo "$!" >"$APP_PID_FILE"
+  disown 2>/dev/null || true
+}
+
+wait_ready() {
+  # Ready = socket file exists AND version handshake answers. Up to ~90 s on
+  # first launch (Ghostty engine init + migrations).
+  local ctl; ctl="$(resolve_ctl)"
+  local deadline=$((SECONDS + 90))
+  while (( SECONDS < deadline )); do
+    if [[ -S "$SOCK" ]] && "$ctl" --socket "$SOCK" system ping >/dev/null 2>&1; then
+      return 0
+    fi
+    # Fail fast when our own process died instead of idling to the deadline.
+    if ! kill -0 "$(cat "$APP_PID_FILE")" 2>/dev/null; then
+      echo "[control-aterm] app exited during launch; tail of $APP_LOG:" >&2
+      tail -n 30 "$APP_LOG" >&2 || true
+      return 1
+    fi
+    sleep 1
+  done
+  echo "[control-aterm] launch timed out waiting for ping; tail of $APP_LOG:" >&2
+  tail -n 30 "$APP_LOG" >&2 || true
+  return 1
+}
+
+stop_pid() {
+  local pid; pid="$(cat "$APP_PID_FILE" 2>/dev/null || echo "")"
+  [[ -n "$pid" ]] || return 0
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    local deadline=$((SECONDS + 10))
+    while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do sleep 0.5; done
+    if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; fi
+  fi
+  rm -f "$APP_PID_FILE"
+}
+
+workspace_count() {
+  local ctl; ctl="$(resolve_ctl)"
+  "$ctl" --socket "$SOCK" workspace list 2>/dev/null | \
+    python3 -c 'import json,sys; print(len(json.load(sys.stdin)["result"]["workspaces"]))' 2>/dev/null || echo "?"
+}
+
+setup_zdotdir() {
+  # VERIFICATION SCAFFOLDING: generic-shell idle is detected by the
+  # app-side `shell-idle-prompt` screen rule, which matches a live prompt
+  # ending in `%`, `$`, `#`, or `>` on the last two screen lines. A themed
+  # login shell (e.g. powerlevel10k ending in `❯`) never matches, so a
+  # verification shell would sit at `unknown` forever through no fault of
+  # the app. Point zsh at a hermetic rc that sets a plain matchable prompt.
+  # The launch path is unchanged (still `$SHELL -l`); only the dotfiles the
+  # shell reads are hermetic. Bash keeps its default `$`-ending prompt and
+  # needs no redirect.
+  mkdir -p "$ZDOTDIR_RUN"
+  cat >"$ZDOTDIR_RUN/.zshrc" <<'EOF'
+# VERIFICATION SCAFFOLDING (control-aterm): deterministic prompt so the
+# shell-idle-prompt screen rule can fire. Not a user config.
+PROMPT='verify-%~$ '
+RPROMPT=''
+EOF
+}
+
+seed_default_workspace() {
+  # VERIFICATION SCAFFOLDING: a fresh hermetic DB opens at onboarding (zero
+  # workspaces) and v1 has no workspace.create method — the first workspace
+  # is born from the onboarding folder picker, which headless runs cannot
+  # click. Insert exactly what adoptWorkspaces() persists for a first run
+  # (one Default row, sort_index 0), then relaunch so bootstrap adopts it.
+  # Timestamps are wall-epoch REALs (see AgentStore Records.swift); harmless
+  # far-future monotonic instants used for ordering/display only.
+  local id now
+  id="$(uuidgen)"
+  now="$(date +%s)"
+  sqlite3 "$DB" "INSERT INTO workspaces (id,name,root_path,sort_index,created_at,updated_at) VALUES ('$id','Default','$WORK_DIR',0,$now,$now);"
+  echo "[control-aterm] seeded Default workspace $id (verification scaffolding)"
+}
+
+cmd_launch() {
+  assert_hermetic
+  if [[ -f "$APP_PID_FILE" ]] && kill -0 "$(cat "$APP_PID_FILE")" 2>/dev/null; then
+    echo "[control-aterm] already running (pid $(cat "$APP_PID_FILE")); run doctor first" >&2; exit 1
+  fi
+  if [[ -e "$SOCK" ]] && [[ ! -d "$RUN_DIR" ]]; then
+    echo "[control-aterm] refusing: socket '$SOCK' exists outside our run dir" >&2; exit 1
+  fi
+  [[ -d "$APP" ]] || { echo "[control-aterm] app not found at '$APP' (build it first; see skill Launch)" >&2; exit 1; }
+  local ctl; ctl="$(resolve_ctl)"
+  [[ -x "$ctl" ]] || { echo "[control-aterm] agentctl not executable at '$ctl'" >&2; exit 1; }
+  mkdir -p "$RUN_DIR" "$GHOSTTY_DIR" "$WORK_DIR" "$EVIDENCE_DIR"
+  setup_zdotdir
+  : >>"$APP_LOG"
+  start_app
+  wait_ready || exit 1
+  if [[ "$(workspace_count)" == "0" ]]; then
+    echo "[control-aterm] fresh DB at onboarding (no workspaces); seeding + relaunching"
+    stop_pid
+    rm -f "$SOCK"
+    seed_default_workspace
+    start_app
+    wait_ready || exit 1
+  fi
+  local count; count="$(workspace_count)"
+  if [[ "$count" == "0" || "$count" == "?" ]]; then
+    echo "[control-aterm] FAIL: no workspaces after seed (count=$count); see $APP_LOG" >&2; exit 1
+  fi
+  echo "[control-aterm] ready run-id=$RUN_ID pid=$(cat "$APP_PID_FILE") workspaces=$count"
+  echo "[control-aterm] socket=$SOCK db=$DB evidence=$EVIDENCE_DIR log=$APP_LOG"
+}
+
+cmd_doctor() {
+  assert_hermetic
+  local ctl; ctl="$(resolve_ctl)"
+  local failures=0
+  # 1. Our process alive?
+  if [[ -f "$APP_PID_FILE" ]] && kill -0 "$(cat "$APP_PID_FILE")" 2>/dev/null; then
+    echo "[doctor] process up pid=$(cat "$APP_PID_FILE")"
+  else
+    echo "[doctor] FAIL process missing (no live pid in $APP_PID_FILE)"; failures=1
+  fi
+  # 2. Socket is ours, owner-only, and answers the version handshake?
+  if [[ -S "$SOCK" ]]; then
+    local mode; mode="$(stat -f %Lp "$SOCK" 2>/dev/null || stat -c %a "$SOCK" 2>/dev/null || echo ?)"
+    echo "[doctor] socket present mode=$mode path=$SOCK"
+    [[ "$mode" == "600" ]] || { echo "[doctor] FAIL socket mode must be 600"; failures=1; }
+  else
+    echo "[doctor] FAIL socket missing at $SOCK"; failures=1
+  fi
+  local ping_out
+  if ping_out="$("$ctl" --socket "$SOCK" system ping 2>&1)"; then
+    echo "[doctor] ping ok $ping_out"
+  else
+    echo "[doctor] FAIL ping: $ping_out"; failures=1
+  fi
+  # 3. Runtime usable: at least one workspace, hermetic DB file present?
+  local ws_out ws_count
+  if ws_out="$("$ctl" --socket "$SOCK" workspace list 2>&1)"; then
+    echo "[doctor] workspaces: $ws_out"
+    ws_count="$(echo "$ws_out" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["result"]["workspaces"]))' 2>/dev/null || echo ?)"
+    [[ "$ws_count" != "0" && "$ws_count" != "?" ]] || { echo "[doctor] FAIL no workspaces (fresh DB? re-run launch to seed)"; failures=1; }
+  else
+    echo "[doctor] FAIL workspace list: $ws_out"; failures=1
+  fi
+  [[ -f "$DB" ]] && echo "[doctor] db present $DB" || { echo "[doctor] FAIL db missing $DB"; failures=1; }
+  if (( failures == 0 )); then echo "[doctor] HEALTHY run-id=$RUN_ID"; else
+    echo "[doctor] UNHEALTHY — do not drive; inspect $APP_LOG"; exit 1
+  fi
+}
+
+cmd_cleanup() {
+  # Kill ONLY what this run started (pid file), never by process name.
+  if [[ -f "$APP_PID_FILE" ]]; then
+    local pid; pid="$(cat "$APP_PID_FILE")"
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "[control-aterm] stopping pid $pid"
+    else
+      echo "[control-aterm] pid $pid already gone"
+    fi
+    stop_pid
+  else
+    echo "[control-aterm] no pid file; nothing to stop"
+  fi
+  # Remove scratch state but NEVER the evidence dir and never the log until
+  # the operator is done (log stays beside the evidence for forensics).
+  rm -f "$SOCK"
+  rm -rf "$WORK_DIR"
+  # Keep: $EVIDENCE_DIR (proof), $APP_LOG (forensics), $DB (post-mortem).
+  # To fully erase a run afterwards: HARD_DELETE=1 rm -rf "$RUN_DIR".
+  if [[ -d "$EVIDENCE_DIR" ]]; then
+    echo "[control-aterm] evidence preserved at $EVIDENCE_DIR"
+    ls -la "$EVIDENCE_DIR"
+  fi
+}
+
+[[ $# -ge 1 ]] || { usage >&2; exit 1; }
+CMD="$1"; shift || true
+CTL="$(resolve_ctl)"
+
+case "$CMD" in
+  launch) cmd_launch ;;
+  doctor) cmd_doctor ;;
+  evidence-dir) echo "$EVIDENCE_DIR" ;;
+  cleanup) cmd_cleanup ;;
+  ping) assert_hermetic; exec "$CTL" --socket "$SOCK" system ping "$@" ;;
+  workspaces) assert_hermetic; exec "$CTL" --socket "$SOCK" workspace list "$@" ;;
+  create|list|get|prompt|wait|read|focus|interrupt|resume|cancel-queued-prompt|stop|subscribe)
+    assert_hermetic
+    if [[ "$CMD" == "subscribe" ]]; then exec "$CTL" --socket "$SOCK" events subscribe "$@"; fi
+    exec "$CTL" --socket "$SOCK" agent "$CMD" "$@" ;;
+  *) echo "[control-aterm] unknown command '$CMD'" >&2; usage >&2; exit 1 ;;
+esac
