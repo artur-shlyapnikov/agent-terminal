@@ -31,7 +31,7 @@ found no matches outside test fixtures.
 
 Launch tickets embed `AGENT_TERMINAL_TOKEN` etc., but tickets are one-shot
 `0600` files deleted by `AgentLauncher` immediately after spawn
-(LaunchTicketWriter + TicketConsumer). The diagnostics redactor additionally
+(LaunchTicketWriter + TicketConsumer). The diagnostics redactor also
 scrubs `VAR=value` shapes from exported lines
 (`DiagnosticRedactor.sanitize`, exercised by ReviewFixTests).
 
